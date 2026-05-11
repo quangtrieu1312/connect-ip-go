@@ -1,6 +1,6 @@
 module github.com/quic-go/connect-ip-go
 
-go 1.24
+go 1.25
 
 require (
 	github.com/dunglas/httpsfv v1.0.2
@@ -9,6 +9,8 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2
 	golang.org/x/net v0.43.0
 )
+
+replace github.com/quic-go/quic-go => github.com/quangtrieu1312/quic-go v0.59.0
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
