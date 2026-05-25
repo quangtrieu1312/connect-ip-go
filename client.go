@@ -13,6 +13,13 @@ import (
 
 // Dial dials a proxied connection to a target server.
 func Dial(ctx context.Context, conn *http3.ClientConn, template *uritemplate.Template) (*Conn, *http.Response, error) {
+	return DialWithHeaders(ctx, conn, template, nil)
+}
+
+// DialWithHeaders is like Dial but merges extra request headers into the
+// CONNECT-IP request (e.g. application-specific tunnel coordinates). The
+// capsule-protocol header is always set and cannot be overridden.
+func DialWithHeaders(ctx context.Context, conn *http3.ClientConn, template *uritemplate.Template, extra http.Header) (*Conn, *http.Response, error) {
 	if len(template.Varnames()) > 0 {
 		return nil, nil, errors.New("connect-ip: IP flow forwarding not supported")
 	}
@@ -41,11 +48,20 @@ func Dial(ctx context.Context, conn *http3.ClientConn, template *uritemplate.Tem
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect-ip: failed to open request stream: %w", err)
 	}
+	hdr := http.Header{http3.CapsuleProtocolHeader: []string{capsuleProtocolHeaderValue}}
+	for k, vs := range extra {
+		if k == http3.CapsuleProtocolHeader {
+			continue
+		}
+		for _, v := range vs {
+			hdr.Add(k, v)
+		}
+	}
 	if err := rstr.SendRequestHeader(&http.Request{
 		Method: http.MethodConnect,
 		Proto:  requestProtocol,
 		Host:   u.Host,
-		Header: http.Header{http3.CapsuleProtocolHeader: []string{capsuleProtocolHeaderValue}},
+		Header: hdr,
 		URL:    u,
 	}); err != nil {
 		return nil, nil, fmt.Errorf("connect-ip: failed to send request: %w", err)
