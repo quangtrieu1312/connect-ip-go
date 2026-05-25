@@ -361,6 +361,13 @@ func (c *Conn) WritePacket(b []byte) (icmp []byte, err error) {
 		log.Printf("dropping proxied packet (%d bytes) that can't be proxied: %s", len(b), err)
 		return nil, nil
 	}
+	if data == nil {
+		return nil, nil
+	}
+	// SendDatagram copies data into its own frame buffer synchronously, so the
+	// composed buffer is dead once SendDatagram returns (including the
+	// DatagramTooLargeError path, which returns before copying). Recycle it.
+	defer datagramComposeBufPool.Put(data[:0])
 	if err := c.str.SendDatagram(data); err != nil {
 		var errDTL *quic.DatagramTooLargeError
 		if errors.As(err, &errDTL) {
@@ -409,11 +416,16 @@ func (c *Conn) composeDatagram(b []byte) ([]byte, error) {
 		}
 		b[7]-- // Decrement Hop Limit
 	}
-	data := make([]byte, 0, len(contextIDZero)+len(b))
+	data := datagramComposeBufPool.Get().([]byte)[:0]
 	data = append(data, contextIDZero...)
 	data = append(data, b...)
 	return data, nil
 }
+
+// datagramComposeBufPool recycles the per-packet buffer built in composeDatagram.
+// Safe because WritePacket is the only caller and SendDatagram copies the buffer
+// into its own frame storage before WritePacket recycles it.
+var datagramComposeBufPool = sync.Pool{New: func() any { return make([]byte, 0, 1500) }}
 
 func (c *Conn) Close() error {
 	c.mu.Lock()
