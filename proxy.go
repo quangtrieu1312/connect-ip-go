@@ -28,7 +28,7 @@ const seqHeaderLen = 4
 // Both peers must run a build that understands context ID 1; a peer on the old
 // framing drops context-1 datagrams (no corruption, but total loss), so deploy
 // both sides together. Defaults on for the tmasque tunnels.
-var SequencingEnabled = true
+var SequencingEnabled = false
 
 type Proxy struct{}
 
