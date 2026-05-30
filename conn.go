@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -19,6 +21,87 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
 )
+
+// Reorder counters at ReceiveDatagram return in ReadPacket (post-http3 stream queue,
+// pre-connect-ip context parse). Compared against quic-go dg_rcvout (upstream) and
+// post-ReadPacket main.go (downstream) to localize where the residual client-side
+// download reorder enters.
+var (
+	cipRecvTotal   = expvar.NewInt("cip_recv_total")
+	cipRecvGenuine = expvar.NewInt("cip_recv_genuine")
+	cipRecvRetr    = expvar.NewInt("cip_recv_retr")
+)
+
+const cipRingSize = 1024
+
+type cipFlow struct {
+	maxSeq uint32
+	ring   [cipRingSize]uint32
+	in     map[uint32]struct{}
+	head   int
+	count  int
+}
+
+// cipObs is touched only by the ReadPacket caller (one goroutine per connect-ip
+// Conn = one tunnel reader) so it needs no lock.
+type cipObs struct {
+	flows map[[13]byte]*cipFlow
+}
+
+func newCipObs() *cipObs { return &cipObs{flows: make(map[[13]byte]*cipFlow)} }
+
+// observe takes the [contextID varint][IP] payload that ReceiveDatagram returns
+// inside ReadPacket. Skips one varint then parses IPv4+TCP seq + 5-tuple key.
+func (o *cipObs) observe(p []byte) {
+	if len(p) < 1 {
+		return
+	}
+	off := 1 << (p[0] >> 6)
+	if off >= len(p) {
+		return
+	}
+	ip := p[off:]
+	if len(ip) < 20 || ip[0]>>4 != 4 {
+		return
+	}
+	ihl := int(ip[0]&0x0f) * 4
+	if ihl < 20 || len(ip) < ihl+8 || ip[9] != 6 {
+		return
+	}
+	tcp := ip[ihl:]
+	seq := binary.BigEndian.Uint32(tcp[4:8])
+	var key [13]byte
+	copy(key[0:4], ip[12:16])
+	copy(key[4:8], ip[16:20])
+	copy(key[8:12], tcp[0:4])
+	key[12] = 6
+	cipRecvTotal.Add(1)
+	f, exists := o.flows[key]
+	if !exists {
+		if len(o.flows) >= 256 {
+			o.flows = make(map[[13]byte]*cipFlow)
+		}
+		f = &cipFlow{in: make(map[uint32]struct{}, cipRingSize)}
+		o.flows[key] = f
+	}
+	if _, dup := f.in[seq]; dup {
+		cipRecvRetr.Add(1)
+		return
+	}
+	if f.count == cipRingSize {
+		delete(f.in, f.ring[f.head])
+	} else {
+		f.count++
+	}
+	f.ring[f.head] = seq
+	f.head = (f.head + 1) % cipRingSize
+	f.in[seq] = struct{}{}
+	if f.count == 1 || int32(seq-f.maxSeq) >= 0 {
+		f.maxSeq = seq
+		return
+	}
+	cipRecvGenuine.Add(1)
+}
 
 type CloseError struct {
 	Remote bool
@@ -72,7 +155,37 @@ type Conn struct {
 
 	closeChan chan struct{}
 	closeErr  error
+
+	// sendSeq is the per-connection monotonic counter stamped into sequenced
+	// datagrams (contextIDSeq). Atomic because WritePacket may be called from
+	// multiple goroutines for one Conn (the client hashes TUN queues to tunnels);
+	// a single inner flow still maps to one caller, so its packets stay monotone.
+	sendSeq atomic.Uint32
+
+	// Receive reorder state for sequenced datagrams. Accessed ONLY by the single
+	// ReadPacket consumer goroutine (one reader per Conn), so it needs no lock.
+	// rcvInit becomes true on the first sequenced packet; rcvNextSeq is the next
+	// seq to deliver; rcvBuf holds out-of-order payloads (copied, owned) keyed by
+	// seq, bounded by reorderWindow. Because datagrams are never retransmitted in
+	// this fork, a missing seq is skipped once the window fills (gap-skip) rather
+	// than waited on forever.
+	rcvInit    bool
+	rcvNextSeq uint32
+	rcvBuf     map[uint32][]byte
+
+	// Seen-set genuine-reorder observer at ReceiveDatagram return (post-http3
+	// stream queue). Single-goroutine = ReadPacket caller, no lock.
+	recvObs *cipObs
 }
+
+// reorderWindow bounds how far out of order the receive buffer will hold packets
+// before it gives up on a missing seq and skips the gap. Sized for the observed
+// adjacent-swap reorder (a few packets) with headroom; larger = more reorder
+// tolerance but more added latency / cross-flow head-of-line when a real gap hits.
+const reorderWindow = 128
+
+// seqAfter reports whether a is strictly after b in 32-bit wraparound order.
+func seqAfter(a, b uint32) bool { return int32(a-b) > 0 }
 
 func newProxiedConn(str http3Stream) *Conn {
 	c := &Conn{
@@ -81,6 +194,8 @@ func newProxiedConn(str http3Stream) *Conn {
 		assignedAddressNotify: make(chan struct{}, 1),
 		availableRoutesNotify: make(chan struct{}, 1),
 		closeChan:             make(chan struct{}),
+		rcvBuf:                make(map[uint32][]byte),
+		recvObs:               newCipObs(),
 	}
 	go func() {
 		if err := c.readFromStream(); err != nil {
@@ -256,31 +371,115 @@ func (c *Conn) writeToStream() error {
 	}
 }
 
-func (c *Conn) ReadPacket(b []byte) (n int, err error) {
-start:
-	data, err := c.str.ReceiveDatagram(context.Background())
-	if err != nil {
-		select {
-		case <-c.closeChan:
-			return 0, c.closeErr
-		default:
-			return 0, err
+func (c *Conn) ReadPacket(b []byte) (int, error) {
+	// Fast path: the next expected sequence is already buffered (it arrived early
+	// while we were waiting for an earlier one) — deliver it without the network.
+	if c.rcvInit {
+		if p, ok := c.rcvBuf[c.rcvNextSeq]; ok {
+			delete(c.rcvBuf, c.rcvNextSeq)
+			c.rcvNextSeq++
+			return copy(b, p), nil
 		}
 	}
-	contextID, n, err := quicvarint.Parse(data)
-	if err != nil {
-		// TODO: close connection
-		return 0, fmt.Errorf("connect-ip: malformed datagram: %w", err)
+
+	for {
+		data, err := c.str.ReceiveDatagram(context.Background())
+		if err != nil {
+			select {
+			case <-c.closeChan:
+				return 0, c.closeErr
+			default:
+				return 0, err
+			}
+		}
+		c.recvObs.observe(data)
+		contextID, hlen, err := quicvarint.Parse(data)
+		if err != nil {
+			// TODO: close connection
+			return 0, fmt.Errorf("connect-ip: malformed datagram: %w", err)
+		}
+
+		// Legacy unsequenced packets (context ID 0) bypass the reorder buffer.
+		if contextID == 0 {
+			payload := data[hlen:]
+			if err := c.handleIncomingProxiedPacket(payload); err != nil {
+				log.Printf("dropping proxied packet: %s", err)
+				continue
+			}
+			return copy(b, payload), nil
+		}
+		if contextID != contextIDSeqVal {
+			continue // unknown context ID — we only proxy IP payloads
+		}
+		if len(data) < hlen+seqHeaderLen {
+			continue // malformed sequenced datagram
+		}
+		seq := binary.BigEndian.Uint32(data[hlen : hlen+seqHeaderLen])
+		payload := data[hlen+seqHeaderLen:]
+		if err := c.handleIncomingProxiedPacket(payload); err != nil {
+			log.Printf("dropping proxied packet: %s", err)
+			continue
+		}
+
+		if !c.rcvInit {
+			c.rcvInit = true
+			c.rcvNextSeq = seq
+		}
+
+		// In order: deliver immediately.
+		if seq == c.rcvNextSeq {
+			c.rcvNextSeq++
+			return copy(b, payload), nil
+		}
+		// Late or duplicate (we already delivered past it): drop.
+		if !seqAfter(seq, c.rcvNextSeq) {
+			continue
+		}
+		// Future packet: buffer a copy (the data slice is recycled on the next
+		// ReceiveDatagram, so we must own it).
+		if _, exists := c.rcvBuf[seq]; !exists {
+			cp := make([]byte, len(payload))
+			copy(cp, payload)
+			c.rcvBuf[seq] = cp
+		}
+		// Window enforcement: if we're holding too much or this packet is too far
+		// ahead, the missing rcvNextSeq is presumed lost (no retransmission in this
+		// fork) — skip the gap by delivering the oldest buffered packet.
+		if len(c.rcvBuf) > reorderWindow || int32(seq-c.rcvNextSeq) >= reorderWindow {
+			if n, ok := c.deliverOldestBuffered(b); ok {
+				return n, nil
+			}
+		}
+		// Otherwise keep receiving until rcvNextSeq arrives (then subsequent calls
+		// drain any now-consecutive buffered packets via the fast path above).
 	}
-	if contextID != 0 {
-		// Drop this datagram. We currently only support proxying of IP payloads.
-		goto start
+}
+
+// deliverOldestBuffered abandons the missing c.rcvNextSeq, advances to the oldest
+// (nearest-future) buffered sequence, and copies it into b. Used for gap-skip when
+// the reorder window is exceeded. Returns false only if the buffer is empty.
+func (c *Conn) deliverOldestBuffered(b []byte) (int, bool) {
+	var oldest uint32
+	bestDist := int32(0)
+	found := false
+	for k := range c.rcvBuf {
+		d := int32(k - c.rcvNextSeq)
+		if d <= 0 {
+			continue // not a future seq (shouldn't happen; late seqs aren't buffered)
+		}
+		if !found || d < bestDist {
+			found = true
+			bestDist = d
+			oldest = k
+		}
 	}
-	if err := c.handleIncomingProxiedPacket(data[n:]); err != nil {
-		log.Printf("dropping proxied packet: %s", err)
-		goto start
+	if !found {
+		return 0, false
 	}
-	return copy(b, data[n:]), nil
+	p := c.rcvBuf[oldest]
+	delete(c.rcvBuf, oldest)
+	c.rcvNextSeq = oldest + 1
+	return copy(b, p), true
 }
 
 func (c *Conn) handleIncomingProxiedPacket(data []byte) error {
@@ -361,6 +560,13 @@ func (c *Conn) WritePacket(b []byte) (icmp []byte, err error) {
 		log.Printf("dropping proxied packet (%d bytes) that can't be proxied: %s", len(b), err)
 		return nil, nil
 	}
+	if data == nil {
+		return nil, nil
+	}
+	// SendDatagram copies data into its own frame buffer synchronously, so the
+	// composed buffer is dead once SendDatagram returns (including the
+	// DatagramTooLargeError path, which returns before copying). Recycle it.
+	defer datagramComposeBufPool.Put(data[:0])
 	if err := c.str.SendDatagram(data); err != nil {
 		var errDTL *quic.DatagramTooLargeError
 		if errors.As(err, &errDTL) {
@@ -409,11 +615,24 @@ func (c *Conn) composeDatagram(b []byte) ([]byte, error) {
 		}
 		b[7]-- // Decrement Hop Limit
 	}
-	data := make([]byte, 0, len(contextIDZero)+len(b))
-	data = append(data, contextIDZero...)
+	data := datagramComposeBufPool.Get().([]byte)[:0]
+	if SequencingEnabled {
+		seq := c.sendSeq.Add(1) - 1 // first packet gets seq 0
+		data = append(data, contextIDSeq...)
+		var s [seqHeaderLen]byte
+		binary.BigEndian.PutUint32(s[:], seq)
+		data = append(data, s[:]...)
+	} else {
+		data = append(data, contextIDZero...)
+	}
 	data = append(data, b...)
 	return data, nil
 }
+
+// datagramComposeBufPool recycles the per-packet buffer built in composeDatagram.
+// Safe because WritePacket is the only caller and SendDatagram copies the buffer
+// into its own frame storage before WritePacket recycles it.
+var datagramComposeBufPool = sync.Pool{New: func() any { return make([]byte, 0, 1500) }}
 
 func (c *Conn) Close() error {
 	c.mu.Lock()
