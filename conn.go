@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,87 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
 )
+
+// Reorder counters at ReceiveDatagram return in ReadPacket (post-http3 stream queue,
+// pre-connect-ip context parse). Compared against quic-go dg_rcvout (upstream) and
+// post-ReadPacket main.go (downstream) to localize where the residual client-side
+// download reorder enters.
+var (
+	cipRecvTotal   = expvar.NewInt("cip_recv_total")
+	cipRecvGenuine = expvar.NewInt("cip_recv_genuine")
+	cipRecvRetr    = expvar.NewInt("cip_recv_retr")
+)
+
+const cipRingSize = 1024
+
+type cipFlow struct {
+	maxSeq uint32
+	ring   [cipRingSize]uint32
+	in     map[uint32]struct{}
+	head   int
+	count  int
+}
+
+// cipObs is touched only by the ReadPacket caller (one goroutine per connect-ip
+// Conn = one tunnel reader) so it needs no lock.
+type cipObs struct {
+	flows map[[13]byte]*cipFlow
+}
+
+func newCipObs() *cipObs { return &cipObs{flows: make(map[[13]byte]*cipFlow)} }
+
+// observe takes the [contextID varint][IP] payload that ReceiveDatagram returns
+// inside ReadPacket. Skips one varint then parses IPv4+TCP seq + 5-tuple key.
+func (o *cipObs) observe(p []byte) {
+	if len(p) < 1 {
+		return
+	}
+	off := 1 << (p[0] >> 6)
+	if off >= len(p) {
+		return
+	}
+	ip := p[off:]
+	if len(ip) < 20 || ip[0]>>4 != 4 {
+		return
+	}
+	ihl := int(ip[0]&0x0f) * 4
+	if ihl < 20 || len(ip) < ihl+8 || ip[9] != 6 {
+		return
+	}
+	tcp := ip[ihl:]
+	seq := binary.BigEndian.Uint32(tcp[4:8])
+	var key [13]byte
+	copy(key[0:4], ip[12:16])
+	copy(key[4:8], ip[16:20])
+	copy(key[8:12], tcp[0:4])
+	key[12] = 6
+	cipRecvTotal.Add(1)
+	f, exists := o.flows[key]
+	if !exists {
+		if len(o.flows) >= 256 {
+			o.flows = make(map[[13]byte]*cipFlow)
+		}
+		f = &cipFlow{in: make(map[uint32]struct{}, cipRingSize)}
+		o.flows[key] = f
+	}
+	if _, dup := f.in[seq]; dup {
+		cipRecvRetr.Add(1)
+		return
+	}
+	if f.count == cipRingSize {
+		delete(f.in, f.ring[f.head])
+	} else {
+		f.count++
+	}
+	f.ring[f.head] = seq
+	f.head = (f.head + 1) % cipRingSize
+	f.in[seq] = struct{}{}
+	if f.count == 1 || int32(seq-f.maxSeq) >= 0 {
+		f.maxSeq = seq
+		return
+	}
+	cipRecvGenuine.Add(1)
+}
 
 type CloseError struct {
 	Remote bool
@@ -90,6 +172,10 @@ type Conn struct {
 	rcvInit    bool
 	rcvNextSeq uint32
 	rcvBuf     map[uint32][]byte
+
+	// Seen-set genuine-reorder observer at ReceiveDatagram return (post-http3
+	// stream queue). Single-goroutine = ReadPacket caller, no lock.
+	recvObs *cipObs
 }
 
 // reorderWindow bounds how far out of order the receive buffer will hold packets
@@ -109,6 +195,7 @@ func newProxiedConn(str http3Stream) *Conn {
 		availableRoutesNotify: make(chan struct{}, 1),
 		closeChan:             make(chan struct{}),
 		rcvBuf:                make(map[uint32][]byte),
+		recvObs:               newCipObs(),
 	}
 	go func() {
 		if err := c.readFromStream(); err != nil {
@@ -305,6 +392,7 @@ func (c *Conn) ReadPacket(b []byte) (int, error) {
 				return 0, err
 			}
 		}
+		c.recvObs.observe(data)
 		contextID, hlen, err := quicvarint.Parse(data)
 		if err != nil {
 			// TODO: close connection
