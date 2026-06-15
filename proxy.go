@@ -2,6 +2,7 @@ package connectip
 
 import (
 	"net/http"
+	"os"
 
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
@@ -27,8 +28,8 @@ const seqHeaderLen = 4
 // SequencingEnabled controls whether WritePacket stamps the contextIDSeq header.
 // Both peers must run a build that understands context ID 1; a peer on the old
 // framing drops context-1 datagrams (no corruption, but total loss), so deploy
-// both sides together. Defaults on for the tmasque tunnels.
-var SequencingEnabled = false
+// both sides together. Off by default; opt in by setting CONNECTIP_SEQ=1 on both peers.
+var SequencingEnabled = os.Getenv("CONNECTIP_SEQ") == "1"
 
 type Proxy struct{}
 
